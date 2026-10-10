@@ -1,3 +1,7 @@
 In order to get the hash info of the NIC, always run the function after you setup the mempool, rx and tx queues, dev configure and start the NIC.
 
 Always check {devInfo.flow_type_rss_offloads} to know your NIC's supported packet types for RSS hashing before trying to configure the packet types in the {struct rte_eth_rss_conf}'s rss_hf field. Remember that this will only tell you about the packet types and now the exact header fields that the RSS hashes. 
+
+Always free the space in the array where you receive packets after the rte_eth_rx_burst() call, once you use those packets.
+
+Don't use the core id as your receive or transmit queue id when you want to dedicate each core to each queue. Never rely on a chance for the core id to match the queue id, always use correct numbers.
