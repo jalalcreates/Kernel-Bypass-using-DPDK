@@ -9,6 +9,10 @@
 #include <rte_errno.h>
 #include <iomanip>
 #include <vector>
+#include <rte_ether.h>
+#include<rte_ip.h>
+#include<rte_udp.h>
+#include <rte_byteorder.h>
 #define BURST 32
 #define RING_SIZE 1024
 #define MEMPOOL_SIZE 8191
@@ -17,11 +21,15 @@
 void configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX);
 void inspectPort(uint16_t portId);
 int worker(void* arg);
+void printPacket(rte_mbuf* m, uint16_t queueId, uint16_t index);
+void printMAC(const rte_ether_addr& mac);
+void printIPv4(uint32_t address);
 
 struct workerSpecifics{
   uint16_t portId;
   uint16_t queueId;
 };
+std::vector<uint16_t> retaEntries;
 
 int main (int argc, char *argv[]) {
   uint16_t portId = 0;
@@ -116,29 +124,187 @@ std::vector<uint8_t> rssKey(devInfo.hash_key_size);
   }
   int retaQueryResult = rte_eth_dev_rss_reta_query(portId,retaQueryConf.data(),devInfo.reta_size);
   if(retaQueryResult<0)rte_exit(EXIT_FAILURE, "RETA query failed: %s\n", rte_strerror(-retaQueryResult));
-  for(int group=0; group<retaGroups;group++){
-    for(int index=0;index<RTE_ETH_RETA_GROUP_SIZE;index++){
-      uint16_t entry = (group*RTE_ETH_RETA_GROUP_SIZE)+index;
-      std::cout<<"RETA["<<entry<<"] = "<<retaQueryConf[group].reta[index]<<'\n';
+  retaEntries.resize(devInfo.reta_size);
+
+for (int group = 0; group < retaGroups; group++) {
+    for (int index = 0; index < RTE_ETH_RETA_GROUP_SIZE; index++) {
+        uint16_t entry = group * RTE_ETH_RETA_GROUP_SIZE + index;
+
+        if (entry < devInfo.reta_size) {
+            retaEntries[entry] = retaQueryConf[group].reta[index];
+        }
     }
-  } 
+}
+
 
   return;
 }
 
 int worker(void* arg){
-std::array<rte_mbuf*, BURST> bufs{};
-  workerSpecifics*  data= static_cast<workerSpecifics*>(arg);
-  while (true) {
-    uint16_t rxPackets = rte_eth_rx_burst(data->portId,data->queueId,bufs.data(),BURST);
-    if(rxPackets!=0){
-      for (uint16_t i = 0; i < rxPackets; i++){
-          struct rte_mbuf* m=bufs[i];
-          // std::cout<<"bufs["<<i<<"] = "<<m->pkt_len<<'\n'<<m->ol_flags<<'\n'<<std::hex<<m->hash.rss<<std::dec<<'\n';
-          rte_pktmbuf_dump(stdout, m, m->pkt_len);
-          rte_pktmbuf_free(bufs[i]);
-      }
+  std::array<rte_mbuf*, BURST> bufs{};
+  workerSpecifics* data=static_cast<workerSpecifics*>(arg);
+
+  while(true){
+    uint16_t rxPackets=rte_eth_rx_burst(data->portId,data->queueId,bufs.data(),BURST);
+    for(uint16_t i=0;i<rxPackets;i++){
+      printPacket(bufs[i],data->queueId,i);
+
+      rte_pktmbuf_free(bufs[i]);
     }
   }
   return 0;
+}
+
+
+void printMAC(const rte_ether_addr& mac){
+  for(int i=0;i<RTE_ETHER_ADDR_LEN;i++){
+    if(i!=0)std::cout<<':';
+    std::cout<<std::hex<<std::setw(2)<<std::setfill('0')
+             <<static_cast<unsigned int>(mac.addr_bytes[i]);
+  }
+  std::cout<<std::dec;
+}
+
+void printIPv4(uint32_t address){
+  uint32_t ip=rte_be_to_cpu_32(address);
+  std::cout<<((ip>>24)&0xff)<<'.'
+           <<((ip>>16)&0xff)<<'.'
+           <<((ip>>8)&0xff)<<'.'
+           <<(ip&0xff);
+}
+
+void printPacket(rte_mbuf* m,uint16_t queueId,uint16_t index){
+  std::cout<<"\n========== RX PACKET ==========\n"
+           <<"RX queue: "<<queueId<<'\n'
+           <<"Packet index in burst: "<<index<<'\n'
+           <<"Packet length: "<<m->pkt_len<<" bytes\n"
+           <<"First segment length: "<<m->data_len<<" bytes\n"
+           <<"Number of segments: "<<static_cast<unsigned>(m->nb_segs)<<'\n'
+           <<"Data offset: "<<m->data_off<<'\n'
+           <<"Offload flags: 0x"<<std::hex<<m->ol_flags<<'\n'
+           <<"Packet type: 0x"<<m->packet_type<<std::dec<<'\n'
+           <<"Port: "<<m->port<<'\n';
+
+if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
+  uint32_t rssHash=m->hash.rss;
+  std::cout<<"RSS hash: 0x"<<std::hex<<rssHash
+           <<std::dec<<" ("<<rssHash<<")\n";
+
+  if(!retaEntries.empty()){
+    uint16_t retaIndex=rssHash&(retaEntries.size()-1);
+    uint16_t expectedQueue=retaEntries[retaIndex];
+
+    std::cout<<"RETA index: "<<retaIndex<<'\n'
+             <<"Expected RX queue: "<<expectedQueue<<'\n'
+             <<"Actual RX queue: "<<queueId<<'\n'
+             <<"RSS queue match: "
+             <<(expectedQueue==queueId?"YES":"NO")<<'\n';
+  }
+}else{
+  std::cout<<"RSS hash: unavailable\n";
+}
+  if(m->data_len<sizeof(rte_ether_hdr)){
+    std::cout<<"Ethernet header incomplete\n";
+    return;
+  }
+
+  rte_ether_hdr* eth=rte_pktmbuf_mtod(m,rte_ether_hdr*);
+  uint16_t etherType=rte_be_to_cpu_16(eth->ether_type);
+
+  std::cout<<"\n--- Ethernet header ---\nDestination MAC: ";
+  printMAC(eth->dst_addr);
+  std::cout<<"\nSource MAC: ";
+  printMAC(eth->src_addr);
+  std::cout<<"\nEtherType: 0x"<<std::hex<<etherType<<std::dec<<'\n';
+
+  if(etherType!=RTE_ETHER_TYPE_IPV4){
+    std::cout<<"IPv4 decoding skipped\n";
+    return;
+  }
+
+  uint16_t ethLen=sizeof(rte_ether_hdr);
+  if(m->data_len<ethLen+sizeof(rte_ipv4_hdr)){
+    std::cout<<"IPv4 header incomplete\n";
+    return;
+  }
+
+  rte_ipv4_hdr* ip=rte_pktmbuf_mtod_offset(m,rte_ipv4_hdr*,ethLen);
+  uint8_t version=ip->version_ihl>>4;
+  uint8_t ihl=(ip->version_ihl&0x0f)*4;
+  uint16_t fragment=rte_be_to_cpu_16(ip->fragment_offset);
+
+  std::cout<<"\n--- IPv4 header ---\n"
+           <<"Version: "<<static_cast<unsigned>(version)<<'\n'
+           <<"Header length: "<<static_cast<unsigned>(ihl)<<" bytes\n"
+           <<"Type of service: 0x"<<std::hex
+           <<static_cast<unsigned>(ip->type_of_service)<<std::dec<<'\n'
+           <<"Total length: "<<rte_be_to_cpu_16(ip->total_length)<<'\n'
+           <<"Identification: "<<rte_be_to_cpu_16(ip->packet_id)<<'\n'
+           <<"Flags: 0x"<<std::hex<<((fragment>>13)&7)<<std::dec<<'\n'
+           <<"Fragment offset: "<<(fragment&0x1fff)<<'\n'
+           <<"TTL: "<<static_cast<unsigned>(ip->time_to_live)<<'\n'
+           <<"Protocol: "<<static_cast<unsigned>(ip->next_proto_id)<<'\n'
+           <<"Header checksum: 0x"<<std::hex
+           <<rte_be_to_cpu_16(ip->hdr_checksum)<<std::dec<<'\n'
+           <<"Source IP: ";
+  printIPv4(ip->src_addr);
+  std::cout<<"\nDestination IP: ";
+  printIPv4(ip->dst_addr);
+  std::cout<<'\n';
+
+  if(ihl<sizeof(rte_ipv4_hdr)||m->data_len<ethLen+ihl){
+    std::cout<<"Invalid or incomplete IPv4 header length\n";
+    return;
+  }
+
+  if(fragment&0x3fff){
+    std::cout<<"Fragmented IPv4 packet; transport decoding skipped\n";
+    return;
+  }
+
+  uint16_t l4Offset=ethLen+ihl;
+
+  if(ip->next_proto_id==IPPROTO_UDP){
+    if(m->data_len<l4Offset+sizeof(rte_udp_hdr)){
+      std::cout<<"UDP header incomplete\n";
+      return;
+    }
+
+    rte_udp_hdr* udp=rte_pktmbuf_mtod_offset(m,rte_udp_hdr*,l4Offset);
+    std::cout<<"\n--- UDP header ---\n"
+             <<"Source port: "<<rte_be_to_cpu_16(udp->src_port)<<'\n'
+             <<"Destination port: "<<rte_be_to_cpu_16(udp->dst_port)<<'\n'
+             <<"UDP length: "<<rte_be_to_cpu_16(udp->dgram_len)<<'\n'
+             <<"UDP checksum: 0x"<<std::hex
+             <<rte_be_to_cpu_16(udp->dgram_cksum)<<std::dec<<'\n';
+  }
+  else if(ip->next_proto_id==IPPROTO_TCP){
+    if(m->data_len<l4Offset+sizeof(rte_tcp_hdr)){
+      std::cout<<"TCP header incomplete\n";
+      return;
+    }
+
+    rte_tcp_hdr* tcp=rte_pktmbuf_mtod_offset(m,rte_tcp_hdr*,l4Offset);
+    uint8_t tcpLen=(tcp->data_off>>4)*4;
+    uint8_t flags=tcp->tcp_flags;
+
+    std::cout<<"\n--- TCP header ---\n"
+             <<"Source port: "<<rte_be_to_cpu_16(tcp->src_port)<<'\n'
+             <<"Destination port: "<<rte_be_to_cpu_16(tcp->dst_port)<<'\n'
+             <<"Sequence number: "<<rte_be_to_cpu_32(tcp->sent_seq)<<'\n'
+             <<"Acknowledgment number: "<<rte_be_to_cpu_32(tcp->recv_ack)<<'\n'
+             <<"Header length: "<<static_cast<unsigned>(tcpLen)<<" bytes\n"
+             <<"Flags: 0x"<<std::hex<<static_cast<unsigned>(flags)<<std::dec<<'\n'
+             <<"Window size: "<<rte_be_to_cpu_16(tcp->rx_win)<<'\n'
+             <<"TCP checksum: 0x"<<std::hex<<rte_be_to_cpu_16(tcp->cksum)
+             <<std::dec<<'\n'
+             <<"Urgent pointer: "<<rte_be_to_cpu_16(tcp->tcp_urp)<<'\n';
+
+    if(tcpLen<sizeof(rte_tcp_hdr)||m->data_len<l4Offset+tcpLen)
+      std::cout<<"TCP options area incomplete or invalid\n";
+    else if(tcpLen>sizeof(rte_tcp_hdr))
+      std::cout<<"TCP options length: "<<tcpLen-sizeof(rte_tcp_hdr)<<" bytes\n";
+  }
+
+  std::cout<<"========== END PACKET ==========\n";
 }
