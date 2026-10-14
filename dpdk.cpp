@@ -13,6 +13,8 @@
 #include<rte_ip.h>
 #include<rte_udp.h>
 #include <rte_byteorder.h>
+#include <rte_thash.h>
+#include <cstring>
 #define BURST 32
 #define RING_SIZE 1024
 #define MEMPOOL_SIZE 8191
@@ -30,7 +32,7 @@ struct workerSpecifics{
   uint16_t queueId;
 };
 std::vector<uint16_t> retaEntries;
-
+std::array<uint32_t, 10> convertedRssKeyWords{};
 int main (int argc, char *argv[]) {
   uint16_t portId = 0;
   configurePort(argc, argv,portId,3,3);
@@ -109,6 +111,9 @@ std::vector<uint8_t> rssKey(devInfo.hash_key_size);
     std::cout<<"Could not get the hash information of the NIC";
     return;
   }
+  std::array<uint32_t, 10> originalRssKeyWords{};
+  std::memcpy(originalRssKeyWords.data(),rssKey.data(),rssKey.size());
+  rte_convert_rss_key(originalRssKeyWords.data(),convertedRssKeyWords.data(),rssKey.size());
   std::cout<<"RSS query result: " << rssInfo << '\n';
   std::cout<<"Configured RSS types: 0x"<<std::hex<<rssConf.rss_hf<<std::dec<<'\n';
   std::cout<<"RSS key: ";
@@ -277,6 +282,18 @@ if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
              <<"UDP length: "<<rte_be_to_cpu_16(udp->dgram_len)<<'\n'
              <<"UDP checksum: 0x"<<std::hex
              <<rte_be_to_cpu_16(udp->dgram_cksum)<<std::dec<<'\n';
+    if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
+        rte_ipv4_tuple tuple{};
+        tuple.src_addr=rte_be_to_cpu_32(ip->src_addr);
+        tuple.dst_addr=rte_be_to_cpu_32(ip->dst_addr);
+        tuple.sport=rte_be_to_cpu_16(udp->src_port);
+        tuple.dport=rte_be_to_cpu_16(udp->dst_port);
+        uint32_t softwareHash=rte_softrss_be( reinterpret_cast<uint32_t*>(&tuple),RTE_THASH_V4_L4_LEN,reinterpret_cast<const uint8_t*>(convertedRssKeyWords.data()));
+        std::cout<<"Software RSS hash: 0x"<<std::hex<<softwareHash<<'\n'
+                <<"Hardware RSS hash: 0x"<<m->hash.rss<<'\n'
+                <<"Hash match: "<<(softwareHash==m->hash.rss?"YES":"NO")
+                <<std::dec<<'\n';
+    }
   }
   else if(ip->next_proto_id==IPPROTO_TCP){
     if(m->data_len<l4Offset+sizeof(rte_tcp_hdr)){
@@ -305,6 +322,5 @@ if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
     else if(tcpLen>sizeof(rte_tcp_hdr))
       std::cout<<"TCP options length: "<<tcpLen-sizeof(rte_tcp_hdr)<<" bytes\n";
   }
-
-  std::cout<<"========== END PACKET ==========\n";
+   std::cout<<"========== END PACKET ==========\n";
 }
