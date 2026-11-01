@@ -14,4 +14,16 @@ Don't confuse advertised capability with enabled configuration.
 
 Don't confuse RSS with a destination-based classifier. The same destination can receive traffic on multiple queues because the source side of the tuple changes the hash.
 
+A successful `rte_ring_enqueue_burst()` does not necessarily mean that every packet was enqueued. Always use its return value to determine how many mbufs actually entered the ring. The remaining mbufs are still your responsibility and must be freed or handled separately.
 
+Treat mbuf ownership as something that moves between components. Once an mbuf is successfully enqueued into a ring, the producer must not access or free it anymore. Ownership passes to the consumer, which becomes responsible for freeing it after processing.
+
+The `RING_F_SP_ENQ` and `RING_F_SC_DEQ` flags are not just performance hints. They describe the actual access pattern of the ring. Only use them when there is exactly one producer and one consumer; having another thread enqueue or dequeue from the same ring violates that assumption.
+
+Never assume that `rte_eth_rx_burst()` fills the entire burst array. Its return value tells you how many packets were actually received, and only those entries contain valid packet pointers. Always use the returned count when processing the array.
+
+Before reading an mbuf's RSS hash, check `RTE_MBUF_F_RX_RSS_HASH` in its `ol_flags`. The hash field is metadata whose validity is indicated by the offload flags; don't assume that a nonzero value means a valid RSS hash.
+
+Don't assume that every IPv4 header is exactly 20 bytes. IPv4 headers can contain options, so calculate the UDP header's position using the IPv4 header length rather than simply adding 20 bytes. Also remember that packet fields are in network byte order, so convert them before using them as normal host-order integers.
+
+A graceful shutdown is a coordination problem, not just a signal-handling problem. Stop producing packets first, tell workers to exit only after draining their rings, wait for every worker to finish, and only then release the rings, NIC resources, and mempool.
