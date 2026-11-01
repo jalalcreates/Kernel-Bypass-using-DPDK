@@ -18,12 +18,13 @@
 #include <rte_ring.h>
 #include<atomic>
 #include <rte_cycles.h>
+#include <csignal>
 #define BURST 32
 #define RING_SIZE 1024
 #define MEMPOOL_SIZE 8191
 #define CACHE_SIZE 32
 
-void configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX);
+rte_mempool* configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX);
 void inspectPort(uint16_t portId);
 int worker(void* arg);
 void printPacket(rte_mbuf* m, uint16_t queueId, uint16_t index);
@@ -44,6 +45,8 @@ struct workerStats{
 };
 std::array<workerStats, 3> stats{};
 std::array<uint64_t, 3> ringRejected{};
+volatile std::sig_atomic_t shutdownRequested = 0;
+std::atomic<bool> forceQuit{false};
 struct workerSpecifics{
     rte_ring* ring;
     uint16_t queueId;
@@ -51,10 +54,23 @@ struct workerSpecifics{
 std::array<std::atomic<uint64_t>, 3> workerCounts{};
 std::vector<uint16_t> retaEntries;
 std::array<uint32_t, 10> convertedRssKeyWords{};
+void signalHandler(int signal){
+    shutdownRequested = 1;
+}
 int main(int argc, char *argv[]){
     uint16_t portId=0;
+    rte_mempool* pool = configurePort(argc,argv,portId,3,3);
+    struct sigaction action{};
 
-    configurePort(argc,argv,portId,3,3);
+    action.sa_handler = signalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    if(sigaction(SIGINT, &action, nullptr) < 0)
+        rte_exit(EXIT_FAILURE, "SIGINT handler registration failed\n");
+
+    if(sigaction(SIGTERM, &action, nullptr) < 0)
+        rte_exit(EXIT_FAILURE, "SIGTERM handler registration failed\n");
     inspectPort(portId);
 
     rte_ring* rings[3];
@@ -100,16 +116,36 @@ int main(int argc, char *argv[]){
             rte_exit(EXIT_FAILURE,"failed to launch worker cores %s\n",rte_strerror(-launched));
 
         queueId++;
+       
     }
-
     if(queueId!=3)
         rte_exit(EXIT_FAILURE,"three worker lcores are required\n");
 
     pollQueues(portId,3,rings);
-
-    return 0;
+    RTE_LCORE_FOREACH_WORKER(coreId){
+        rte_eal_wait_lcore(coreId);
+    }
+for(uint16_t i=0; i<3; i++){
+    rte_ring_free(rings[i]);
 }
-void configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX){
+
+int ret = rte_eth_dev_stop(portId);
+if(ret < 0)
+    rte_exit(EXIT_FAILURE,"failed to stop port\n");
+
+ret = rte_eth_dev_close(portId);
+if(ret < 0)
+    rte_exit(EXIT_FAILURE,"failed to close port\n");
+
+rte_mempool_free(pool);
+
+ret = rte_eal_cleanup();
+if(ret < 0)
+    rte_exit(EXIT_FAILURE,"failed to clean up EAL\n");
+
+return 0;
+}
+rte_mempool* configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX){
   int result = rte_eal_init(argc, argv);
   if(result <0)rte_exit(EXIT_FAILURE, "initialization error");
   argc -=result;argv+=result;
@@ -140,7 +176,7 @@ void configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint
   int started =  rte_eth_dev_start(portId);
   if(started <0)rte_exit(EXIT_FAILURE,"could not start the NIC");
 
-    return;
+    return pool;
 }
 
 void inspectPort(uint16_t portId){
@@ -161,7 +197,7 @@ std::vector<uint8_t> rssKey(devInfo.hash_key_size);
   if(rssInfo<0) {
     std::cout<<"Could not get the hash information of the NIC";
     return;
-  }
+   }
   std::array<uint32_t, 10> originalRssKeyWords{};
   std::memcpy(originalRssKeyWords.data(),rssKey.data(),rssKey.size());
   rte_convert_rss_key(originalRssKeyWords.data(),convertedRssKeyWords.data(),rssKey.size());
@@ -201,7 +237,7 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
     std::array<void*, BURST> objects{};
     std::array<uint64_t, 3> packetCounts{};
 
-    while(true){
+    while(!shutdownRequested){
         for(uint16_t queueId=0; queueId<nbQueues; queueId++){
             uint16_t rxPackets=rte_eth_rx_burst(
                 portId,
@@ -247,7 +283,7 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
         std::cout
             << "W0 IPv4: "
             << stats[0].ipv4Packets.load()
-             << " || W1 UDP: "
+            << " || W1 UDP: "
             << stats[1].udpPackets.load()
             << " | UDP payload bytes: "
             << stats[1].udpPayloadBytes.load()
@@ -262,8 +298,15 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
             << ringRejected[1] << " | "
             << ringRejected[2]
             << '\n';
-}    }
-}struct packetInfo{
+      }    
+    }
+    if(shutdownRequested)
+      std::cout << "\nSIGINT/SIGTERM received by application.\n";
+
+    forceQuit.store(true);
+}
+
+struct packetInfo{
     bool ipv4 = false;
     bool udp = false;
     uint16_t udpPayloadBytes = 0;
@@ -359,7 +402,7 @@ int worker(void* arg){
     workerSpecifics* data = static_cast<workerSpecifics*>(arg);
     std::array<void*, BURST> bufs{};
 
-    while(true){
+    while(!forceQuit.load() || !rte_ring_empty(data->ring)){
         unsigned int received = rte_ring_dequeue_burst(
             data->ring,
             bufs.data(),
@@ -454,7 +497,7 @@ if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
   printMAC(eth->src_addr);
   std::cout<<"\nEtherType: 0x"<<std::hex<<etherType<<std::dec<<'\n';
 
-  if(etherType!=RTE_ETHER_TYPE_IPV4){
+   if(etherType!=RTE_ETHER_TYPE_IPV4){
     std::cout<<"IPv4 decoding skipped\n";
     return;
   }
@@ -497,7 +540,7 @@ if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
   if(fragment&0x3fff){
     std::cout<<"Fragmented IPv4 packet; transport decoding skipped\n";
     return;
-   }
+  }
 
   uint16_t l4Offset=ethLen+ihl;
 
