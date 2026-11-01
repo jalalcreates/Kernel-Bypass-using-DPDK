@@ -17,6 +17,7 @@
 #include <cstring>
 #include <rte_ring.h>
 #include<atomic>
+#include <rte_cycles.h>
 #define BURST 32
 #define RING_SIZE 1024
 #define MEMPOOL_SIZE 8191
@@ -29,6 +30,9 @@ void printPacket(rte_mbuf* m, uint16_t queueId, uint16_t index);
 void printMAC(const rte_ether_addr& mac);
 void printIPv4(uint32_t address);
 void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]);
+void processIPv4(rte_mbuf* m);
+void processUDP(rte_mbuf* m);
+void classifyPacketSize(rte_mbuf* m);
 
 struct workerStats{
     std::atomic<uint64_t> processed{0};
@@ -39,6 +43,7 @@ struct workerStats{
     std::atomic<uint64_t> largePackets{0};
 };
 std::array<workerStats, 3> stats{};
+std::array<uint64_t, 3> ringRejected{};
 struct workerSpecifics{
     rte_ring* ring;
     uint16_t queueId;
@@ -190,6 +195,7 @@ for (int group = 0; group < retaGroups; group++) {
 
   return;
 }
+
 void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
     std::array<rte_mbuf*, BURST> bufs{};
     std::array<void*, BURST> objects{};
@@ -216,7 +222,8 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
                 rxPackets,
                 nullptr
             );
-
+            unsigned int rejected = rxPackets - enqueued;
+            ringRejected[queueId] += rejected;
             for(unsigned int i=enqueued; i<rxPackets; i++){
                 rte_pktmbuf_free(bufs[i]);
             }
@@ -240,7 +247,7 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
         std::cout
             << "W0 IPv4: "
             << stats[0].ipv4Packets.load()
-            << " || W1 UDP: "
+             << " || W1 UDP: "
             << stats[1].udpPackets.load()
             << " | UDP payload bytes: "
             << stats[1].udpPayloadBytes.load()
@@ -249,9 +256,14 @@ void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
             << " | large: "
             << stats[2].largePackets.load()
             << '\n';
+        std::cout
+            << "RING REJECTED: "
+            << ringRejected[0] << " | "
+            << ringRejected[1] << " | "
+            << ringRejected[2]
+            << '\n';
 }    }
-}
-struct packetInfo{
+}struct packetInfo{
     bool ipv4 = false;
     bool udp = false;
     uint16_t udpPayloadBytes = 0;
@@ -321,6 +333,28 @@ bool inspectPacket(rte_mbuf* m, packetInfo& info){
 
     return true;
 }
+void processIPv4(rte_mbuf* m){
+    packetInfo info{};
+
+    if(inspectPacket(m, info) && info.ipv4)
+        stats[0].ipv4Packets++;
+}
+
+void processUDP(rte_mbuf* m){
+    packetInfo info{};
+
+    if(inspectPacket(m, info) && info.udp){
+        stats[1].udpPackets++;
+        stats[1].udpPayloadBytes += info.udpPayloadBytes;
+    }
+}
+
+void classifyPacketSize(rte_mbuf* m){
+    if(m->pkt_len <= 128)
+        stats[2].smallPackets++;
+    else
+        stats[2].largePackets++;
+}
 int worker(void* arg){
     workerSpecifics* data = static_cast<workerSpecifics*>(arg);
     std::array<void*, BURST> bufs{};
@@ -329,32 +363,26 @@ int worker(void* arg){
         unsigned int received = rte_ring_dequeue_burst(
             data->ring,
             bufs.data(),
-            BURST,
+             BURST,
             nullptr
         );
 
         for(unsigned int i = 0; i < received; i++){
             auto* m = static_cast<rte_mbuf*>(bufs[i]);
 
-            if(data->queueId == 0){
-                packetInfo info{};
+            switch(data->queueId){
+                case 0:
+                    processIPv4(m);
+                    break;
 
-                if(inspectPacket(m, info) && info.ipv4)
-                    stats[0].ipv4Packets++;
-            }
-            else if(data->queueId == 1){
-                packetInfo info{};
+                case 1:
+                    processUDP(m);
+                    break;
 
-                if(inspectPacket(m, info) && info.udp){
-                    stats[1].udpPackets++;
-                    stats[1].udpPayloadBytes += info.udpPayloadBytes;
-                }
-            }
-            else if(data->queueId == 2){
-                if(m->pkt_len <= 128)
-                    stats[2].smallPackets++;
-                else
-                    stats[2].largePackets++;
+                case 2:
+                    rte_delay_us_sleep(20000);
+                    classifyPacketSize(m);
+                    break;
             }
 
             stats[data->queueId].processed++;
@@ -365,8 +393,7 @@ int worker(void* arg){
     }
 
     return 0;
-}
-void printMAC(const rte_ether_addr& mac){
+}void printMAC(const rte_ether_addr& mac){
   for(int i=0;i<RTE_ETHER_ADDR_LEN;i++){
     if(i!=0)std::cout<<':';
     std::cout<<std::hex<<std::setw(2)<<std::setfill('0')
@@ -470,7 +497,7 @@ if(m->ol_flags&RTE_MBUF_F_RX_RSS_HASH){
   if(fragment&0x3fff){
     std::cout<<"Fragmented IPv4 packet; transport decoding skipped\n";
     return;
-  }
+   }
 
   uint16_t l4Offset=ethLen+ihl;
 

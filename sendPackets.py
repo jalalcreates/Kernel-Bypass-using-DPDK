@@ -1,15 +1,14 @@
+
 from scapy.all import Ether, IP, UDP, Raw, sendp
 import ipaddress
 import struct
-import time
 
 IFACE = "tap1"
 DST_MAC = "52:54:00:12:34:02"
 SRC_MAC = "02:00:00:00:00:01"
 DST_IP = "10.0.0.2"
 DST_PORT = 6000
-DELAY = 0.05
-PACKETS_PER_FLOW = 10
+PACKETS_PER_FLOW = 5000
 
 RSS_KEY = bytes.fromhex(
     "6d 5a 56 da 25 5b 0e c2 41 67 25 3d 43 a3 8f b0 "
@@ -87,10 +86,17 @@ def main():
             / Raw(f"RSS queue {queue} test".encode())
         )
 
-        for sequence in range(PACKETS_PER_FLOW):
-            sendp(packet, iface=IFACE, verbose=False)
-            print(f"Queue {queue}: Sent {sequence + 1}/{PACKETS_PER_FLOW}")
-            time.sleep(DELAY)
+        print(f"Sending {PACKETS_PER_FLOW} packets to Queue {queue}...")
+
+        sendp(
+            packet,
+            iface=IFACE,
+            count=PACKETS_PER_FLOW,
+            inter=0,
+            verbose=False
+        )
+
+        print(f"Queue {queue}: Transmission completed.")
 
     print("\nAll packets sent.")
 
