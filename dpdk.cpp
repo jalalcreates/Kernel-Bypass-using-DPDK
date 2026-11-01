@@ -15,6 +15,8 @@
 #include <rte_byteorder.h>
 #include <rte_thash.h>
 #include <cstring>
+#include <rte_ring.h>
+#include<atomic>
 #define BURST 32
 #define RING_SIZE 1024
 #define MEMPOOL_SIZE 8191
@@ -26,38 +28,82 @@ int worker(void* arg);
 void printPacket(rte_mbuf* m, uint16_t queueId, uint16_t index);
 void printMAC(const rte_ether_addr& mac);
 void printIPv4(uint32_t address);
+void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]);
 
-struct workerSpecifics{
-  uint16_t portId;
-  uint16_t queueId;
+struct workerStats{
+    std::atomic<uint64_t> processed{0};
+    std::atomic<uint64_t> ipv4Packets{0};
+    std::atomic<uint64_t> udpPackets{0};
+    std::atomic<uint64_t> udpPayloadBytes{0};
+    std::atomic<uint64_t> smallPackets{0};
+    std::atomic<uint64_t> largePackets{0};
 };
+std::array<workerStats, 3> stats{};
+struct workerSpecifics{
+    rte_ring* ring;
+    uint16_t queueId;
+};
+std::array<std::atomic<uint64_t>, 3> workerCounts{};
 std::vector<uint16_t> retaEntries;
 std::array<uint32_t, 10> convertedRssKeyWords{};
-int main (int argc, char *argv[]) {
-  uint16_t portId = 0;
-  configurePort(argc, argv,portId,3,3);
-  inspectPort(portId);
+int main(int argc, char *argv[]){
+    uint16_t portId=0;
 
-  workerSpecifics workerArgs[3];
-  uint32_t coreId;
-  uint16_t queueId = 0;
+    configurePort(argc,argv,portId,3,3);
+    inspectPort(portId);
 
-  RTE_LCORE_FOREACH_WORKER(coreId){
-    if (queueId>=3)
-        break;
-    workerArgs[queueId] = {
-        portId,
-        queueId
+    rte_ring* rings[3];
+
+    const char* ringNames[3] = {
+        "ring_0",
+        "ring_1",
+        "ring_2"
     };
 
-    int launched = rte_eal_remote_launch(worker,&workerArgs[queueId],coreId);
-    if(launched<0)rte_exit(EXIT_FAILURE,"failed to launch worker cores %s\n",rte_strerror(-launched));
-    queueId++;
-  }
-  rte_eal_mp_wait_lcore();
-  return 0;
-}
+    for(uint16_t i=0; i<3; i++){
+        rings[i]=rte_ring_create(
+            ringNames[i],
+            RING_SIZE,
+            rte_socket_id(),
+            RING_F_SP_ENQ | RING_F_SC_DEQ
+        );
 
+        if(rings[i]==nullptr)
+            rte_exit(EXIT_FAILURE,"failed to create ring %u\n",i);
+    }
+
+    workerSpecifics workerArgs[3];
+    uint32_t coreId;
+    uint16_t queueId=0;
+
+    RTE_LCORE_FOREACH_WORKER(coreId){
+        if(queueId>=3)
+            break;
+
+        workerArgs[queueId]={
+            rings[queueId],
+            queueId
+        };
+
+        int launched=rte_eal_remote_launch(
+            worker,
+            &workerArgs[queueId],
+            coreId
+        );
+
+        if(launched<0)
+            rte_exit(EXIT_FAILURE,"failed to launch worker cores %s\n",rte_strerror(-launched));
+
+        queueId++;
+    }
+
+    if(queueId!=3)
+        rte_exit(EXIT_FAILURE,"three worker lcores are required\n");
+
+    pollQueues(portId,3,rings);
+
+    return 0;
+}
 void configurePort( int argc, char *argv[], uint16_t portId, uint16_t nbRX, uint16_t nbTX){
   int result = rte_eal_init(argc, argv);
   if(result <0)rte_exit(EXIT_FAILURE, "initialization error");
@@ -144,23 +190,182 @@ for (int group = 0; group < retaGroups; group++) {
 
   return;
 }
+void pollQueues(uint16_t portId, uint16_t nbQueues, rte_ring* rings[]){
+    std::array<rte_mbuf*, BURST> bufs{};
+    std::array<void*, BURST> objects{};
+    std::array<uint64_t, 3> packetCounts{};
 
-int worker(void* arg){
-  std::array<rte_mbuf*, BURST> bufs{};
-  workerSpecifics* data=static_cast<workerSpecifics*>(arg);
+    while(true){
+        for(uint16_t queueId=0; queueId<nbQueues; queueId++){
+            uint16_t rxPackets=rte_eth_rx_burst(
+                portId,
+                queueId,
+                bufs.data(),
+                BURST
+            );
 
-  while(true){
-    uint16_t rxPackets=rte_eth_rx_burst(data->portId,data->queueId,bufs.data(),BURST);
-    for(uint16_t i=0;i<rxPackets;i++){
-      printPacket(bufs[i],data->queueId,i);
+            packetCounts[queueId]+=rxPackets;
 
-      rte_pktmbuf_free(bufs[i]);
-    }
-  }
-  return 0;
+            for(uint16_t i=0; i<rxPackets; i++){
+                objects[i]=bufs[i];
+            }
+
+            unsigned int enqueued=rte_ring_enqueue_burst(
+                rings[queueId],
+                objects.data(),
+                rxPackets,
+                nullptr
+            );
+
+            for(unsigned int i=enqueued; i<rxPackets; i++){
+                rte_pktmbuf_free(bufs[i]);
+            }
+        }
+
+        static uint64_t iterations=0;
+        iterations++;
+
+       if(iterations % 1000000 == 0){
+        std::cout
+            << "RX: "
+            << packetCounts[0] << " | "
+            << packetCounts[1] << " | "
+            << packetCounts[2]
+            << " || WORKERS: "
+            << workerCounts[0].load() << " | "
+            << workerCounts[1].load() << " | "
+            << workerCounts[2]
+            << '\n';
+
+        std::cout
+            << "W0 IPv4: "
+            << stats[0].ipv4Packets.load()
+            << " || W1 UDP: "
+            << stats[1].udpPackets.load()
+            << " | UDP payload bytes: "
+            << stats[1].udpPayloadBytes.load()
+            << " || W2 small: "
+            << stats[2].smallPackets.load()
+            << " | large: "
+            << stats[2].largePackets.load()
+            << '\n';
+}    }
 }
+struct packetInfo{
+    bool ipv4 = false;
+    bool udp = false;
+    uint16_t udpPayloadBytes = 0;
+};
 
+bool inspectPacket(rte_mbuf* m, packetInfo& info){
+    if(m->pkt_len < sizeof(rte_ether_hdr))
+        return false;
 
+    rte_ether_hdr ethStorage{};
+    auto* eth = reinterpret_cast<const rte_ether_hdr*>(
+        rte_pktmbuf_read(m, 0, sizeof(ethStorage), &ethStorage)
+    );
+
+    if(!eth || rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4)
+        return true;
+
+    info.ipv4 = true;
+
+    constexpr uint32_t ipOffset = sizeof(rte_ether_hdr);
+
+    if(m->pkt_len < ipOffset + sizeof(rte_ipv4_hdr))
+        return true;
+
+    rte_ipv4_hdr ipStorage{};
+    auto* ip = reinterpret_cast<const rte_ipv4_hdr*>(
+        rte_pktmbuf_read(m, ipOffset, sizeof(ipStorage), &ipStorage)
+    );
+
+    if(!ip)
+        return true;
+
+    uint16_t ipHeaderLength = (ip->version_ihl & 0x0f) * 4;
+
+    if(ipHeaderLength < sizeof(rte_ipv4_hdr))
+        return true;
+
+    if(ip->next_proto_id != IPPROTO_UDP)
+        return true;
+
+    uint16_t ipTotalLength = rte_be_to_cpu_16(ip->total_length);
+
+    if(ipTotalLength < ipHeaderLength + sizeof(rte_udp_hdr))
+        return true;
+
+    uint32_t udpOffset = ipOffset + ipHeaderLength;
+
+    if(m->pkt_len < udpOffset + sizeof(rte_udp_hdr))
+        return true;
+
+    rte_udp_hdr udpStorage{};
+    auto* udp = reinterpret_cast<const rte_udp_hdr*>(
+        rte_pktmbuf_read(m, udpOffset, sizeof(udpStorage), &udpStorage)
+    );
+
+    if(!udp)
+        return true;
+
+    uint16_t udpLength = rte_be_to_cpu_16(udp->dgram_len);
+
+    if(udpLength < sizeof(rte_udp_hdr) ||
+       udpLength > ipTotalLength - ipHeaderLength)
+        return true;
+
+    info.udp = true;
+    info.udpPayloadBytes = udpLength - sizeof(rte_udp_hdr);
+
+    return true;
+}
+int worker(void* arg){
+    workerSpecifics* data = static_cast<workerSpecifics*>(arg);
+    std::array<void*, BURST> bufs{};
+
+    while(true){
+        unsigned int received = rte_ring_dequeue_burst(
+            data->ring,
+            bufs.data(),
+            BURST,
+            nullptr
+        );
+
+        for(unsigned int i = 0; i < received; i++){
+            auto* m = static_cast<rte_mbuf*>(bufs[i]);
+
+            if(data->queueId == 0){
+                packetInfo info{};
+
+                if(inspectPacket(m, info) && info.ipv4)
+                    stats[0].ipv4Packets++;
+            }
+            else if(data->queueId == 1){
+                packetInfo info{};
+
+                if(inspectPacket(m, info) && info.udp){
+                    stats[1].udpPackets++;
+                    stats[1].udpPayloadBytes += info.udpPayloadBytes;
+                }
+            }
+            else if(data->queueId == 2){
+                if(m->pkt_len <= 128)
+                    stats[2].smallPackets++;
+                else
+                    stats[2].largePackets++;
+            }
+
+            stats[data->queueId].processed++;
+            rte_pktmbuf_free(m);
+        }
+
+        workerCounts[data->queueId] += received;
+    }
+
+    return 0;
+}
 void printMAC(const rte_ether_addr& mac){
   for(int i=0;i<RTE_ETHER_ADDR_LEN;i++){
     if(i!=0)std::cout<<':';

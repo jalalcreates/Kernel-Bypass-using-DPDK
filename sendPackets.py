@@ -1,74 +1,98 @@
 from scapy.all import Ether, IP, UDP, Raw, sendp
+import ipaddress
+import struct
 import time
 
 IFACE = "tap1"
 DST_MAC = "52:54:00:12:34:02"
 SRC_MAC = "02:00:00:00:00:01"
-BASE_SRC_IP = "10.0.0.1"
-BASE_DST_IP = "10.0.0.2"
-BASE_SRC_PORT = 5000
-BASE_DST_PORT = 6000
-DELAY = 0.03
+DST_IP = "10.0.0.2"
+DST_PORT = 6000
+DELAY = 0.05
+PACKETS_PER_FLOW = 10
 
-def send_packet(src_ip=BASE_SRC_IP, dst_ip=BASE_DST_IP, sport=BASE_SRC_PORT, dport=BASE_DST_PORT, payload=b"RSS experiment"):
-    packet = Ether(src=SRC_MAC, dst=DST_MAC) / IP(src=src_ip, dst=dst_ip) / UDP(sport=sport, dport=dport) / Raw(payload)
-    sendp(packet, iface=IFACE, verbose=False)
-    time.sleep(DELAY)
+RSS_KEY = bytes.fromhex(
+    "6d 5a 56 da 25 5b 0e c2 41 67 25 3d 43 a3 8f b0 "
+    "d0 ca 2b cb ae 7b 30 b4 77 cb 2d a3 80 30 f2 0c "
+    "6a 42 b7 3b be ac 01 fa"
+)
 
-def send_group(name, packets):
-    print("\n" + name)
-    for index, packet in enumerate(packets, 1):
-        print(f"{index}: {packet}")
-        send_packet(**packet)
+def toeplitz_hash(data):
+    key = int.from_bytes(RSS_KEY, "big")
+    value = int.from_bytes(data, "big")
+    hash_value = 0
+    data_bits = len(data) * 8
 
-def flow(src_ip=BASE_SRC_IP, dst_ip=BASE_DST_IP, sport=BASE_SRC_PORT, dport=BASE_DST_PORT, payload=b"RSS experiment"):
-    return {"src_ip": src_ip, "dst_ip": dst_ip, "sport": sport, "dport": dport, "payload": payload}
+    for i in range(data_bits):
+        if (value >> (data_bits - 1 - i)) & 1:
+            hash_value ^= (key >> (len(RSS_KEY) * 8 - i - 32)) & 0xffffffff
+
+    return hash_value
+
+def find_flows():
+    flows = {}
+
+    for last_octet in range(1, 255):
+        src_ip = f"10.2.0.{last_octet}"
+
+        for src_port in range(5000, 6001):
+            data = (
+                ipaddress.IPv4Address(src_ip).packed
+                + ipaddress.IPv4Address(DST_IP).packed
+                + struct.pack("!HH", src_port, DST_PORT)
+            )
+
+            rss_hash = toeplitz_hash(data)
+            reta_index = rss_hash & 0x7f
+            queue = reta_index % 3
+
+            if queue not in flows:
+                flows[queue] = (
+                    src_ip,
+                    src_port,
+                    rss_hash,
+                    reta_index
+                )
+
+            if len(flows) == 3:
+                return flows
+
+    return flows
 
 def main():
-    send_group("EXPERIMENT 1A: SAME FLOW, 20 IDENTICAL PACKETS", [flow() for _ in range(20)])
+    flows = find_flows()
 
-    send_group("EXPERIMENT 1B: ALTERNATING BETWEEN TWO FLOWS", [
-        flow(sport=5100 if i % 2 == 0 else 5101) for i in range(20)
-    ])
+    if len(flows) != 3:
+        print("Could not find flows for all three queues.")
+        return
 
-    send_group("EXPERIMENT 2A: SOURCE PORT CHANGES", [
-        flow(sport=5200 + i) for i in range(16)
-    ])
+    for queue in range(3):
+        src_ip, src_port, rss_hash, reta_index = flows[queue]
 
-    send_group("EXPERIMENT 2B: DESTINATION PORT CHANGES", [
-        flow(dport=6100 + i) for i in range(16)
-    ])
+        print(
+            f"Queue {queue}: {src_ip}:{src_port} "
+            f"| Hash: 0x{rss_hash:08x} "
+            f"| RETA: {reta_index}"
+        )
 
-    send_group("EXPERIMENT 2C: SOURCE IP CHANGES", [
-        flow(src_ip=f"10.0.{i // 250}.{(i % 250) + 1}") for i in range(1, 17)
-    ])
+    print("\nSending packets...\n")
 
-    send_group("EXPERIMENT 2D: DESTINATION IP CHANGES", [
-        flow(dst_ip=f"10.1.{i // 250}.{(i % 250) + 1}") for i in range(1, 17)
-    ])
+    for queue in range(3):
+        src_ip, src_port, _, _ = flows[queue]
 
-    send_group("EXPERIMENT 2E: PAYLOAD CHANGES ONLY", [
-        flow(payload=f"payload variant {i}".encode()) for i in range(12)
-    ])
+        packet = (
+            Ether(src=SRC_MAC, dst=DST_MAC)
+            / IP(src=src_ip, dst=DST_IP)
+            / UDP(sport=src_port, dport=DST_PORT)
+            / Raw(f"RSS queue {queue} test".encode())
+        )
 
-    send_group("EXPERIMENT 2F: SOURCE AND DESTINATION PORTS CHANGE TOGETHER", [
-        flow(sport=5300 + i, dport=6300 + i) for i in range(16)
-    ])
+        for sequence in range(PACKETS_PER_FLOW):
+            sendp(packet, iface=IFACE, verbose=False)
+            print(f"Queue {queue}: Sent {sequence + 1}/{PACKETS_PER_FLOW}")
+            time.sleep(DELAY)
 
-    send_group("EXPERIMENT 3A: MANY FLOWS, SAME DESTINATION IP AND PORT", [
-        flow(sport=5400 + i, dst_ip=BASE_DST_IP, dport=BASE_DST_PORT) for i in range(64)
-    ])
-
-    send_group("EXPERIMENT 3B: MANY SOURCE IPS, SAME DESTINATION IP AND PORT", [
-        flow(src_ip=f"10.2.{i // 250}.{(i % 250) + 1}", sport=5500 + i, dport=BASE_DST_PORT)
-        for i in range(1, 33)
-    ])
-
-    send_group("EXPERIMENT 3C: SAME DESTINATION, VARYING UDP SOURCE PORTS", [
-        flow(sport=5600 + i, dport=BASE_DST_PORT) for i in range(32)
-    ])
-
-    print("\nFinished sending all experiments.")
+    print("\nAll packets sent.")
 
 if __name__ == "__main__":
     main()
